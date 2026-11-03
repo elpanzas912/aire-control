@@ -91,5 +91,4 @@ cargo run --features demo -- --demo
 
 Las tramas del aire son un puerto de [msmart-ng](https://github.com/mill1000/midea-msmart), y las pruebas comparan el resultado
 byte a byte con esa librería. La forma de reenviar comandos por la nube está basada en lo que documenta
-[jasonzzeng/midea-streamdeck](https://github.com/jasonzzeng/midea-streamdeck). Ese repositorio no incluye una licencia, así que
-conviene revisarlo antes de hacer público este programa.
+[jasonzzeng/midea-streamdeck](https://github.com/jasonzzeng/midea-streamdeck), que no incluye una licencia.
