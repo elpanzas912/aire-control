@@ -1,0 +1,14 @@
+/target/
+*.db
+*.log
+
+# El programa compilado se publica en Releases
+/AireControl.exe
+
+# Prototipo en Python: no forma parte del programa
+/.venv/
+__pycache__/
+/*.py
+/iniciar.bat
+/requirements.txt
+/tests/
