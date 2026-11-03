@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Instant;
 
-use windows::core::{w, PCWSTR};
+use windows::core::{w, BOOL, PCWSTR};
 use windows::Win32::Foundation::*;
 use windows::Win32::Graphics::Dwm::*;
 use windows::Win32::Graphics::Gdi::*;
@@ -16,6 +16,7 @@ use windows::Win32::UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
+use crate::animacion::{cobertura, tramos, Cajon, Curva, Tono, Valor};
 use crate::bandeja::{self, MENSAJE_BANDEJA};
 use crate::hilo::{Compartido, Pedido, MENSAJE_VISTA};
 use crate::historial::Historia;
@@ -68,7 +69,26 @@ const ICONO_VIENTO: u32 = 1;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 const TEMPORIZADOR_ENVIO: usize = 1;
 const TEMPORIZADOR_RELOJ: usize = 2;
+const TEMPORIZADOR_GIRO: usize = 3;
 const ESPERA_ENVIO_MS: u32 = 350;
+const CUADRO_GIRO_MS: u32 = 33;
+
+// Duraciones en milisegundos. Lo que responde a un toque no llega a 300, para no sentirse lento.
+const MS_ABRIR: f32 = 220.0;
+const MS_CERRAR: f32 = 160.0;
+const MS_ALTO: f32 = 220.0;
+const MS_CONTENIDO: f32 = 140.0;
+const MS_ELEGIR: f32 = 200.0;
+const MS_COLOR: f32 = 180.0;
+const MS_REGLA: f32 = 160.0;
+const MS_TRAMO: f32 = 220.0;
+const MS_INTERRUPTOR: f32 = 160.0;
+const MS_CALIENTE: f32 = 90.0;
+const MS_APRETAR: f32 = 100.0;
+const MS_SOLTAR: f32 = 160.0;
+const ESPERA_MAXIMA_ACTUALIZAR_MS: f64 = 5000.0;
+const ESCALA_APRETADO: f32 = 0.97;
+const ANCHO_PESTANA: f32 = 62.0;
 
 const MENU_ABRIR: u32 = 1;
 const MENU_ENCENDER: u32 = 2;
@@ -135,6 +155,93 @@ pub struct Opciones {
     pub pestana: Pestana,
     pub abrir: bool,
     pub titulo: &'static str,
+    pub lentitud: f64,
+    pub quieto: bool,
+    pub hay_cuenta: bool,
+}
+
+/// Dónde va la ventana en reposo y hacia qué borde se esconde.
+#[derive(Clone, Copy, Default)]
+struct Lugar {
+    x: i32,
+    arriba: i32,
+    abajo: i32,
+    ancho: i32,
+    margen: i32,
+    anclado_abajo: bool,
+    eje: (i32, i32),
+    se_desliza: bool,
+}
+
+/// Lo que cambia de a poco dentro del panel.
+struct Transiciones {
+    contenido: Valor,
+    datos: Valor,
+    caliente: Valor,
+    caliente_previo: Option<Accion>,
+    apriete: Valor,
+    apretado: Option<Accion>,
+    pestana: Valor,
+    rango: Valor,
+    modo: Valor,
+    ventilador: Valor,
+    acento: Tono,
+    prendido: Valor,
+    pidiendo: Valor,
+    objetivo: Valor,
+    cuarto: Valor,
+    tramos: [Valor; 2],
+    interruptor: Valor,
+    recordar: Valor,
+}
+
+impl Transiciones {
+    const fn nuevas() -> Self {
+        Self {
+            contenido: Valor::quieto(1.0),
+            datos: Valor::quieto(1.0),
+            caliente: Valor::quieto(1.0),
+            caliente_previo: None,
+            apriete: Valor::quieto(0.0),
+            apretado: None,
+            pestana: Valor::quieto(0.0),
+            rango: Valor::quieto(0.0),
+            modo: Valor::quieto(0.0),
+            ventilador: Valor::quieto(0.0),
+            acento: Tono::quieto(Color::rgb(0x79C6F5)),
+            prendido: Valor::quieto(0.0),
+            pidiendo: Valor::quieto(0.0),
+            objetivo: Valor::quieto(0.0),
+            cuarto: Valor::quieto(0.0),
+            tramos: [Valor::quieto(0.0), Valor::quieto(0.0)],
+            interruptor: Valor::quieto(0.0),
+            recordar: Valor::quieto(0.0),
+        }
+    }
+
+    fn en_curso(&self, t: f64) -> bool {
+        self.acento.en_curso(t)
+            || [
+                &self.contenido,
+                &self.datos,
+                &self.caliente,
+                &self.apriete,
+                &self.pestana,
+                &self.rango,
+                &self.modo,
+                &self.ventilador,
+                &self.prendido,
+                &self.pidiendo,
+                &self.objetivo,
+                &self.cuarto,
+                &self.tramos[0],
+                &self.tramos[1],
+                &self.interruptor,
+                &self.recordar,
+            ]
+            .iter()
+            .any(|v| v.en_curso(t))
+    }
 }
 
 pub struct App {
@@ -167,6 +274,44 @@ pub struct App {
     memoria_inicial_devuelta: bool,
     pincel_campo: HBRUSH,
     fuente_campo: HFONT,
+    origen: Instant,
+    reloj: f64,
+    movimiento: bool,
+    lugar: Lugar,
+    puesto: (i32, i32, i32, i32),
+    apertura: Valor,
+    cajon: Cajon,
+    tras_la_barra: bool,
+    preparando: bool,
+    cerrando: bool,
+    t: Transiciones,
+    saltar: bool,
+    regla_directa: bool,
+    girando: bool,
+    actualizando: Option<(f64, i64)>,
+}
+
+fn x_de_pestana(p: Pestana) -> f32 {
+    let x = ANCHO - M - 30.0 - 6.0 - ANCHO_PESTANA * 2.0;
+    if p == Pestana::Datos {
+        x + ANCHO_PESTANA
+    } else {
+        x
+    }
+}
+
+/// La opción "Mostrar animaciones" de Windows.
+fn windows_anima() -> bool {
+    let mut activas = BOOL(1);
+    unsafe {
+        let _ = SystemParametersInfoW(
+            SPI_GETCLIENTAREAANIMATION,
+            0,
+            Some(&mut activas as *mut BOOL as *mut _),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+    }
+    activas.as_bool()
 }
 
 fn grados(valor: Option<f32>) -> String {
@@ -243,10 +388,62 @@ impl App {
 
     // Ventana
 
+    fn ms(&self) -> f64 {
+        self.origen.elapsed().as_secs_f64() * 1000.0 / self.opciones.lentitud
+    }
+
+    /// Duración de algo que se mueve. Lo que se hace con el teclado no se anima: si no, se siente lento.
+    fn ms_movimiento(&self, ms: f32) -> f32 {
+        if self.saltar || !self.movimiento || self.teclado {
+            0.0
+        } else {
+            ms
+        }
+    }
+
+    /// Los fundidos de color se mantienen aunque Windows tenga las animaciones apagadas.
+    fn ms_color(&self, ms: f32) -> f32 {
+        if self.saltar || self.teclado {
+            0.0
+        } else {
+            ms
+        }
+    }
+
+    /// Abre deslizando desde atrás de la barra de tareas. No se funde con la transparencia de ventana
+    /// (WS_EX_LAYERED) porque Windows le saca el acrílico, y Windows no anima solo este tipo de ventana.
     fn mostrar(&mut self) {
+        if self.visible {
+            unsafe {
+                let _ = SetForegroundWindow(self.ventana);
+            }
+            return;
+        }
+        let vuelve_mientras_cerraba = self.cerrando;
+        self.cerrando = false;
         self.visible = true;
         self.inicio_windows = inicio::activo();
-        self.ubicar();
+        self.movimiento = windows_anima() && !self.opciones.quieto;
+        self.saltar = true;
+        self.t.contenido.saltar(1.0);
+        self.t.datos.saltar(1.0);
+        self.t.pestana.saltar(x_de_pestana(self.pestana));
+        self.t.apretado = None;
+        self.t.apriete.saltar(0.0);
+        self.t.caliente_previo = None;
+        if !vuelve_mientras_cerraba {
+            self.ubicar(false);
+        }
+        let desliza = self.movimiento && self.lugar.se_desliza;
+        if !vuelve_mientras_cerraba {
+            self.apertura.saltar(if desliza { 0.0 } else { 1.0 });
+            self.colocar(self.ms());
+        }
+        if desliza {
+            // Antes de mostrarla: todavía no está dibujada y no tiene que asomar sobre la barra
+            self.pasar_atras_de_la_barra();
+            self.preparando = true;
+        }
         unsafe {
             let _ = ShowWindow(self.ventana, SW_SHOW);
             let _ = SetForegroundWindow(self.ventana);
@@ -258,25 +455,158 @@ impl App {
             self.enviar(Pedido::Historia(self.rango));
         }
         self.sincronizar_campos();
-        self.redibujar();
+        self.revisar_giro();
+        if desliza {
+            // Se dibuja antes de arrancar: preparar el primer cuadro no le tiene que comer tiempo a la animación
+            self.redibujar();
+            unsafe {
+                let _ = UpdateWindow(self.ventana);
+            }
+            self.preparando = false;
+            self.apertura.ir_a(1.0, MS_ABRIR, Curva::Salida, self.ms());
+            self.latido();
+        } else {
+            self.fundir_contenido();
+            self.redibujar();
+        }
     }
 
+    /// Cierra deslizando hacia la barra de tareas.
     fn ocultar(&mut self) {
+        self.cerrar(self.movimiento && self.lugar.se_desliza);
+    }
+
+    /// Para el teclado: desaparece enseguida.
+    fn ocultar_ya(&mut self) {
+        self.cerrar(false);
+    }
+
+    fn cerrar(&mut self, deslizar: bool) {
         if !self.visible || self.opciones.sin_ocultar {
             return;
         }
         self.visible = false;
         self.oculto_en = Some(Instant::now());
-        self.lienzo = None;
         self.foco = None;
         self.teclado = false;
         self.caliente = None;
         unsafe {
-            let _ = ShowWindow(self.ventana, SW_HIDE);
             let _ = KillTimer(Some(self.ventana), TEMPORIZADOR_RELOJ);
         }
+        self.revisar_giro();
         self.enviar(Pedido::PanelAbierto(false));
+        if deslizar {
+            self.cerrando = true;
+            self.pasar_atras_de_la_barra();
+            self.apertura.ir_a(0.0, MS_CERRAR, Curva::Salida, self.ms());
+            self.latido();
+        } else {
+            self.terminar_cierre();
+        }
+    }
+
+    fn terminar_cierre(&mut self) {
+        self.cerrando = false;
+        self.tras_la_barra = false;
+        self.lienzo = None;
+        unsafe {
+            let _ = ShowWindow(self.ventana, SW_HIDE);
+        }
         devolver_memoria();
+    }
+
+    /// Pide un cuadro sin volver a dibujar: para mover la ventana alcanza.
+    fn latido(&self) {
+        let punto = RECT { left: 0, top: 0, right: 1, bottom: 1 };
+        unsafe {
+            let _ = InvalidateRect(Some(self.ventana), Some(&punto), false);
+        }
+    }
+
+    /// Avanza las transiciones después de cada pintado, y pide otro cuadro solo si queda alguna en curso.
+    fn avanzar(&mut self) {
+        if self.preparando {
+            return;
+        }
+        let t = self.ms();
+        self.colocar(t);
+        let deslizando = self.apertura.en_curso(t) || self.cajon.en_curso(t);
+        if !deslizando {
+            if self.cerrando {
+                self.terminar_cierre();
+                return;
+            }
+            if self.cajon.asentar(t) {
+                self.colocar(t);
+            }
+            self.volver_al_frente();
+        }
+        let contenido = self.visible && self.t.en_curso(t);
+        if contenido || deslizando {
+            unsafe {
+                let _ = DwmFlush();
+            }
+            if contenido {
+                self.redibujar();
+            } else {
+                self.latido();
+            }
+        }
+    }
+
+    /// Lo que asoma de más mientras la ventana se desliza queda tapado por la barra de tareas.
+    fn pasar_atras_de_la_barra(&mut self) {
+        if self.tras_la_barra {
+            return;
+        }
+        unsafe {
+            if let Ok(barra) = FindWindowW(w!("Shell_TrayWnd"), PCWSTR::null()) {
+                let _ = SetWindowPos(self.ventana, Some(barra), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                self.tras_la_barra = true;
+            }
+        }
+    }
+
+    fn volver_al_frente(&mut self) {
+        if self.tras_la_barra {
+            self.tras_la_barra = false;
+            unsafe {
+                let _ = SetWindowPos(self.ventana, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+        }
+    }
+
+    fn fundir_contenido(&mut self) {
+        self.t.contenido.saltar(0.0);
+        self.t.contenido.ir_a(1.0, MS_CONTENIDO, Curva::Salida, self.ms());
+    }
+
+    /// La vista nueva aparece fundida y la ventana toma su alto.
+    fn al_cambiar_vista(&mut self) {
+        self.saltar = true;
+        if !self.teclado {
+            self.fundir_contenido();
+        }
+        self.ubicar(!self.teclado);
+        self.sincronizar_campos();
+        self.revisar_giro();
+        self.redibujar();
+    }
+
+    /// Los giros no necesitan todos los cuadros de la pantalla: tienen su propio reloj, más lento.
+    fn revisar_giro(&mut self) {
+        let esperando = self.vista_actual() == VistaPanel::Espera && self.vista.error.is_none();
+        let quiere = self.visible && (esperando || self.actualizando.is_some());
+        if quiere != self.girando {
+            self.girando = quiere;
+            unsafe {
+                if quiere {
+                    SetTimer(Some(self.ventana), TEMPORIZADOR_GIRO, CUADRO_GIRO_MS, None);
+                } else {
+                    let _ = KillTimer(Some(self.ventana), TEMPORIZADOR_GIRO);
+                }
+            }
+        }
     }
 
     fn alternar(&mut self) {
@@ -288,7 +618,41 @@ impl App {
         }
     }
 
-    fn ubicar(&self) {
+    fn ubicar(&mut self, animar: bool) {
+        let (lugar, alto) = self.medir_lugar();
+        self.lugar = lugar;
+        let t = self.ms();
+        if animar && self.visible && self.movimiento && lugar.anclado_abajo && lugar.se_desliza {
+            self.cajon.cambiar_alto(alto, MS_ALTO, t);
+            if self.cajon.en_curso(t) {
+                self.pasar_atras_de_la_barra();
+            }
+        } else {
+            self.cajon = Cajon::fijo(alto);
+        }
+        self.colocar(t);
+    }
+
+    fn colocar(&mut self, t: f64) {
+        let l = self.lugar;
+        let alto = self.cajon.alto().round() as i32;
+        let recorrido = if l.eje.1 != 0 { alto + l.margen } else { l.ancho + l.margen };
+        let oculto = ((1.0 - self.apertura.en(t)) * recorrido as f32).round() as i32;
+        let y = if l.anclado_abajo { l.abajo - alto + self.cajon.desplazo(t).round() as i32 } else { l.arriba };
+        let puesto = (l.x + l.eje.0 * oculto, y + l.eje.1 * oculto, l.ancho, alto);
+        if puesto != self.puesto {
+            let mut banderas = SWP_NOZORDER | SWP_NOACTIVATE;
+            if (puesto.2, puesto.3) == (self.puesto.2, self.puesto.3) {
+                banderas |= SWP_NOSIZE;
+            }
+            self.puesto = puesto;
+            unsafe {
+                let _ = SetWindowPos(self.ventana, None, puesto.0, puesto.1, puesto.2, puesto.3, banderas);
+            }
+        }
+    }
+
+    fn medir_lugar(&self) -> (Lugar, f32) {
         unsafe {
             let zona = bandeja::rectangulo(self.ventana).unwrap_or_else(|| {
                 let mut punto = POINT::default();
@@ -306,8 +670,40 @@ impl App {
             let margen = (12.0 * escala) as i32;
             let (trabajo, pantalla) = (info.rcWork, info.rcMonitor);
             let x = if trabajo.left > pantalla.left { trabajo.left + margen } else { trabajo.right - ancho - margen };
-            let y = if trabajo.top > pantalla.top { trabajo.top + margen } else { trabajo.bottom - alto - margen };
-            let _ = SetWindowPos(self.ventana, Some(HWND_TOPMOST), x, y, ancho, alto, SWP_NOACTIVATE);
+            // Se esconde hacia donde está la barra de tareas; si no se ve ninguna, hacia abajo
+            let eje = if trabajo.top > pantalla.top {
+                (0, -1)
+            } else if trabajo.left > pantalla.left {
+                (-1, 0)
+            } else if trabajo.right < pantalla.right {
+                (1, 0)
+            } else {
+                (0, 1)
+            };
+            let afuera = POINT {
+                x: match eje.0 {
+                    -1 => pantalla.left - 1,
+                    1 => pantalla.right,
+                    _ => x + ancho / 2,
+                },
+                y: match eje.1 {
+                    -1 => pantalla.top - 1,
+                    1 => pantalla.bottom,
+                    _ => trabajo.bottom - alto / 2,
+                },
+            };
+            let lugar = Lugar {
+                x,
+                arriba: trabajo.top + margen,
+                abajo: trabajo.bottom - margen,
+                ancho,
+                margen,
+                anclado_abajo: trabajo.top <= pantalla.top,
+                eje,
+                // Con otra pantalla pegada de ese lado, el panel asomaría en ella
+                se_desliza: MonitorFromPoint(afuera, MONITOR_DEFAULTTONULL).is_invalid(),
+            };
+            (lugar, alto as f32)
         }
     }
 
@@ -403,10 +799,14 @@ impl App {
             (p.vista.clone(), std::mem::take(&mut p.avisos), p.tooltip.clone())
         };
         let alto_anterior = self.alto();
+        let rango_anterior = self.vista.historia.as_ref().map(|h| h.0);
         self.vista = vista;
         self.tooltip = tooltip;
         if self.vista.cambios_atendidos >= self.numero_cambio {
             self.en_vuelo = Cambios::default();
+        }
+        if self.actualizando.is_some_and(|(_, antes)| self.vista.actualizado != antes || self.vista.error.is_some()) {
+            self.actualizando = None;
         }
         self.actualizar_icono();
         for aviso in avisos {
@@ -416,10 +816,16 @@ impl App {
             self.memoria_inicial_devuelta = true;
             devolver_memoria();
         }
+        self.revisar_giro();
         if self.visible {
-            if fase_anterior != self.vista_actual() || alto_anterior != self.alto() {
-                self.ubicar();
-                self.sincronizar_campos();
+            if fase_anterior != self.vista_actual() {
+                self.al_cambiar_vista();
+            } else if alto_anterior != self.alto() {
+                self.ubicar(!self.teclado);
+            }
+            if rango_anterior != self.vista.historia.as_ref().map(|h| h.0) {
+                self.t.datos.saltar(0.0);
+                self.t.datos.ir_a(1.0, MS_CONTENIDO, Curva::Salida, self.ms());
             }
             if self.vista.fase == Fase::CuentaRechazada && fase_anterior != VistaPanel::Login {
                 Self::limpiar_clave();
@@ -498,6 +904,8 @@ impl App {
     }
 
     fn fijar_desde_regla(&mut self, x: f32) {
+        // Arrastrando, la marca sigue al ratón sin demora
+        self.regla_directa = true;
         let t = TEMP_MINIMA + ((x - REGLA_X) / REGLA_ANCHO * (TEMP_MAXIMA - TEMP_MINIMA)).round();
         let t = t.clamp(TEMP_MINIMA, TEMP_MAXIMA);
         if self.estado_visible().is_some_and(|e| e.objetivo != t && e.modo != MODO_VENTILAR) {
@@ -516,9 +924,7 @@ impl App {
         self.vista.fase = Fase::Conectando;
         self.vista.error = None;
         self.enviar(Pedido::Conectar { cuenta, contrasena, recordar: self.recordar });
-        self.ubicar();
-        self.sincronizar_campos();
-        self.redibujar();
+        self.al_cambiar_vista();
     }
 
     fn ejecutar(&mut self, accion: Accion) {
@@ -541,13 +947,15 @@ impl App {
             Accion::CancelarApagado => self.enviar(Pedido::CancelarApagado),
             Accion::CancelarEncendido => self.enviar(Pedido::CancelarEncendido),
             Accion::Pestana(p) => {
+                if self.pestana == Pestana::Ajustes {
+                    self.t.pestana.saltar(x_de_pestana(p));
+                }
                 self.pestana = p;
                 self.foco = None;
                 if p == Pestana::Datos {
                     self.enviar(Pedido::Historia(self.rango));
                 }
-                self.ubicar();
-                self.redibujar();
+                self.al_cambiar_vista();
             }
             Accion::Rango(r) => {
                 self.rango = r;
@@ -559,6 +967,9 @@ impl App {
                 if self.pestana == Pestana::Datos {
                     self.enviar(Pedido::Historia(self.rango));
                 }
+                self.actualizando = Some((self.ms(), self.vista.actualizado));
+                self.revisar_giro();
+                self.redibujar();
             }
             Accion::Exportar => self.enviar(Pedido::ExportarCsv),
             Accion::InicioWindows => {
@@ -577,9 +988,7 @@ impl App {
                 self.enviar(Pedido::Olvidar);
                 self.vista.fase = Fase::SinCuenta;
                 self.pestana = Pestana::Control;
-                self.ubicar();
-                self.sincronizar_campos();
-                self.redibujar();
+                self.al_cambiar_vista();
             }
             Accion::Salir => self.salir(),
             Accion::Entrar => self.entrar(),
@@ -659,8 +1068,17 @@ impl App {
         let nuevo = self.zona_en(x, y);
         let en_grafico = self.pestana == Pestana::Datos && GRAFICO.contiene(x, y);
         if nuevo != self.caliente || en_grafico || self.pestana == Pestana::Datos {
-            self.caliente = nuevo;
+            self.fijar_caliente(nuevo);
             self.redibujar();
+        }
+    }
+
+    fn fijar_caliente(&mut self, nuevo: Option<Accion>) {
+        if nuevo != self.caliente {
+            self.t.caliente_previo = self.caliente;
+            self.caliente = nuevo;
+            self.t.caliente.saltar(0.0);
+            self.t.caliente.ir_a(1.0, MS_CALIENTE, Curva::Suave, self.ms());
         }
     }
 
@@ -669,6 +1087,9 @@ impl App {
         self.apretado = self.zona_en(x, y);
         if self.apretado == Some(Accion::Regla) {
             self.fijar_desde_regla(x);
+        } else if self.apretado.is_some() && self.movimiento {
+            self.t.apretado = self.apretado;
+            self.t.apriete.ir_a(1.0, MS_APRETAR, Curva::Salida, self.ms());
         }
         unsafe {
             SetCapture(self.ventana);
@@ -680,6 +1101,7 @@ impl App {
         unsafe {
             let _ = ReleaseCapture();
         }
+        self.t.apriete.ir_a(0.0, MS_SOLTAR, Curva::Salida, self.ms());
         let apretado = self.apretado.take();
         if let Some(accion) = apretado {
             if self.zona_en(x, y) == Some(accion) {
@@ -691,9 +1113,15 @@ impl App {
 
     fn al_tecla(&mut self, tecla: u16) {
         match VIRTUAL_KEY(tecla) {
-            VK_ESCAPE => self.ocultar(),
-            VK_UP => self.mover_objetivo(1.0),
-            VK_DOWN => self.mover_objetivo(-1.0),
+            VK_ESCAPE => self.ocultar_ya(),
+            VK_UP => {
+                self.regla_directa = true;
+                self.mover_objetivo(1.0);
+            }
+            VK_DOWN => {
+                self.regla_directa = true;
+                self.mover_objetivo(-1.0);
+            }
             VK_TAB if !self.zonas.is_empty() => {
                 self.teclado = true;
                 let atras = unsafe { GetKeyState(VK_SHIFT.0 as i32) } < 0;
@@ -726,15 +1154,24 @@ impl App {
             self.lienzo = self.fabricas.as_ref().and_then(|f| Lienzo::nuevo(self.ventana, f).ok());
         }
         let Some(mut l) = self.lienzo.take() else { return };
+        self.reloj = self.ms();
         self.zonas.clear();
         l.empezar();
         let fondo = if self.con_vidrio { VELO } else { SUPERFICIE };
         l.caja(Caja::new(0.0, 0.0, ANCHO, 2000.0), 0.0, fondo);
+        let opacidad = self.t.contenido.en(self.reloj);
         match self.vista_actual() {
-            VistaPanel::Login => self.pintar_login(&mut l),
-            VistaPanel::Espera => self.pintar_espera(&mut l),
+            VistaPanel::Login => {
+                l.fijar_opacidad(opacidad);
+                self.pintar_login(&mut l);
+            }
+            VistaPanel::Espera => {
+                l.fijar_opacidad(opacidad);
+                self.pintar_espera(&mut l);
+            }
             VistaPanel::Normal => {
                 self.pintar_cabecera(&mut l);
+                l.fijar_opacidad(opacidad);
                 match self.pestana {
                     Pestana::Control => self.pintar_control(&mut l),
                     Pestana::Datos => self.pintar_datos(&mut l),
@@ -742,6 +1179,8 @@ impl App {
                 }
             }
         }
+        l.fijar_opacidad(1.0);
+        self.saltar = false;
         self.pintar_foco(&mut l);
         if l.terminar().is_ok() {
             self.lienzo = Some(l);
@@ -761,20 +1200,39 @@ impl App {
         self.zonas.push(Zona { caja, accion });
     }
 
+    /// Cuánto del brillo de pasar el ratón por encima tiene ahora este control, de 0 a 1.
+    fn brillo_de(&self, accion: Accion) -> f32 {
+        let paso = self.t.caliente.en(self.reloj);
+        if self.caliente == Some(accion) {
+            paso
+        } else if self.t.caliente_previo == Some(accion) {
+            1.0 - paso
+        } else {
+            0.0
+        }
+    }
+
     fn fondo_de(&self, accion: Accion) -> Color {
         if self.apretado == Some(accion) {
             CONTROL_APRETADO
-        } else if self.caliente == Some(accion) {
-            CONTROL_HOVER
         } else {
-            CONTROL
+            CONTROL.mezcla(CONTROL_HOVER, self.brillo_de(accion))
+        }
+    }
+
+    /// Encoge apenas lo que se está apretando. Después de dibujarlo hay que llamar a `sin_transformar`.
+    fn aplicar_apriete(&self, l: &Lienzo, c: Caja, accion: Accion) {
+        if self.t.apretado == Some(accion) {
+            l.escalar(c, 1.0 - (1.0 - ESCALA_APRETADO) * self.t.apriete.en(self.reloj));
         }
     }
 
     fn boton_icono(&mut self, l: &mut Lienzo, c: Caja, icono: u32, tamano: f32, accion: Accion, activo: bool) {
         if activo {
+            self.aplicar_apriete(l, c, accion);
             l.caja(c, 6.0, self.fondo_de(accion));
             l.icono(icono, c, tamano, TEXTO);
+            l.sin_transformar();
             self.zona(c, accion);
         } else {
             l.caja(c, 6.0, Color(0xFFFFFF, 0.03));
@@ -788,33 +1246,42 @@ impl App {
             self.boton_icono(l, Caja::new(ANCHO - M - 30.0, 13.0, 30.0, 28.0), ICONO_VOLVER, 13.0, Accion::Pestana(Pestana::Control), true);
             return;
         }
-        let ancho_boton = 62.0;
-        let x = ANCHO - M - 30.0 - 6.0 - ancho_boton * 2.0;
-        for (i, (nombre, p)) in [("Control", Pestana::Control), ("Datos", Pestana::Datos)].into_iter().enumerate() {
-            let c = Caja::new(x + i as f32 * ancho_boton, 13.0, ancho_boton, 28.0);
-            let accion = Accion::Pestana(p);
-            if self.pestana == p {
-                l.caja(c, 6.0, Color(0xFFFFFF, 0.16));
-                l.texto(nombre, c, 12.0, Peso::Medio, Alinear::Centro, TEXTO);
-            } else {
-                if self.caliente == Some(accion) {
-                    l.caja(c, 6.0, CONTROL);
-                }
-                l.texto(nombre, c, 12.0, Peso::Normal, Alinear::Centro, TEXTO_2);
+        let pestanas = [("Control", Pestana::Control), ("Datos", Pestana::Datos)];
+        for (_, p) in pestanas {
+            let brillo = self.brillo_de(Accion::Pestana(p));
+            if self.pestana != p && brillo > 0.0 {
+                l.caja(Caja::new(x_de_pestana(p), 13.0, ANCHO_PESTANA, 28.0), 6.0, CONTROL.con_alfa(CONTROL.1 * brillo));
             }
-            self.zona(c, accion);
+        }
+        let ms = if self.movimiento && !self.teclado { MS_ELEGIR } else { 0.0 };
+        self.t.pestana.ir_a(x_de_pestana(self.pestana), ms, Curva::Movimiento, self.reloj);
+        let pildora = self.t.pestana.en(self.reloj);
+        l.caja(Caja::new(pildora, 13.0, ANCHO_PESTANA, 28.0), 6.0, Color(0xFFFFFF, 0.16));
+        for (nombre, p) in pestanas {
+            let c = Caja::new(x_de_pestana(p), 13.0, ANCHO_PESTANA, 28.0);
+            let peso = if self.pestana == p { Peso::Medio } else { Peso::Normal };
+            let color = TEXTO_2.mezcla(TEXTO, cobertura(pildora, c.x, ANCHO_PESTANA));
+            l.texto(nombre, c, 12.0, peso, Alinear::Centro, color);
+            self.zona(c, Accion::Pestana(p));
         }
         self.boton_icono(l, Caja::new(ANCHO - M - 30.0, 13.0, 30.0, 28.0), ICONO_AJUSTES, 13.0, Accion::Pestana(Pestana::Ajustes), true);
     }
 
     fn pintar_control(&mut self, l: &mut Lienzo) {
         let Some(e) = self.estado_visible() else { return };
-        let acento = acento_de(e.modo);
         let ventilando = e.modo == MODO_VENTILAR;
+        let reloj = self.reloj;
+        let ms_color = self.ms_color(MS_COLOR);
+        self.t.acento.ir_a(acento_de(e.modo), ms_color, reloj);
+        self.t.prendido.ir_a(if e.encendido { 1.0 } else { 0.0 }, ms_color, Curva::Suave, reloj);
+        self.t.pidiendo.ir_a(if e.encendido && !ventilando { 1.0 } else { 0.0 }, ms_color, Curva::Suave, reloj);
+        let acento = self.t.acento.en(reloj);
+        let prendido = self.t.prendido.en(reloj);
+        let pidiendo = self.t.pidiendo.en(reloj);
 
         // La cifra grande: lo que se está pidiendo
         let texto_objetivo = if ventilando { "—".to_string() } else { format!("{}°", decimal(e.objetivo)) };
-        let color_objetivo = if e.encendido && !ventilando { acento } else { TEXTO_2 };
+        let color_objetivo = TEXTO_2.mezcla(acento, pidiendo);
         l.texto(&texto_objetivo, Caja::new(M - 3.0, 46.0, 190.0, 78.0), 68.0, Peso::Liviano, Alinear::Izquierda, color_objetivo);
         let estado = match (e.encendido, ventilando) {
             (false, _) => "Apagado".to_string(),
@@ -829,36 +1296,54 @@ impl App {
         l.texto("Afuera", Caja::new(derecha, 100.0, 110.0, 16.0), 11.0, Peso::Normal, Alinear::Derecha, TEXTO_3);
         l.texto(&grados(e.exterior), Caja::new(derecha, 115.0, 110.0, 26.0), 20.0, Peso::Normal, Alinear::Derecha, TEXTO);
 
-        self.pintar_regla(l, &e, acento);
+        self.pintar_regla(l, &e, acento, prendido, pidiendo);
 
         // Prender, y ajuste fino
         let y = 204.0;
         self.boton_icono(l, Caja::new(M, y, 52.0, 44.0), ICONO_MENOS, 15.0, Accion::Menos, !ventilando && e.objetivo > TEMP_MINIMA);
         self.boton_icono(l, Caja::new(ANCHO - M - 52.0, y, 52.0, 44.0), ICONO_MAS, 15.0, Accion::Mas, !ventilando && e.objetivo < TEMP_MAXIMA);
         let poder = Caja::new(M + 58.0, y, INTERIOR - 116.0, 44.0);
-        let (fondo, letra, nombre) = if e.encendido {
-            (self.fondo_de(Accion::Encender), TEXTO, "Apagar")
-        } else {
-            let alfa = if self.apretado == Some(Accion::Encender) { 0.75 } else { 1.0 };
-            (acento.con_alfa(alfa), SOBRE_ACENTO, "Prender")
-        };
+        let nombre = if e.encendido { "Apagar" } else { "Prender" };
+        let alfa = if self.apretado == Some(Accion::Encender) { 0.75 } else { 1.0 };
+        let fondo = acento.con_alfa(alfa).mezcla(self.fondo_de(Accion::Encender), prendido);
+        let letra = SOBRE_ACENTO.mezcla(TEXTO, prendido);
+        self.aplicar_apriete(l, poder, Accion::Encender);
         l.caja(poder, 8.0, fondo);
         let ancho_texto = l.medir(nombre, 14.0, Peso::Medio);
         let inicio_x = poder.x + (poder.w - ancho_texto - 24.0) / 2.0;
         l.icono(ICONO_POWER, Caja::new(inicio_x, poder.y, 18.0, poder.h), 14.0, letra);
         l.texto(nombre, Caja::new(inicio_x + 24.0, poder.y, ancho_texto + 4.0, poder.h), 14.0, Peso::Medio, Alinear::Izquierda, letra);
+        l.sin_transformar();
         self.zona(poder, Accion::Encender);
 
-        // Modo
+        // Modo: una sola píldora viaja hasta la opción elegida
         let y = 258.0;
         let separacion = 4.0;
         let ancho_modo = (INTERIOR - separacion * 4.0) / 5.0;
-        for (i, (modo, nombre, icono, color)) in MODOS.iter().enumerate() {
-            let c = Caja::new(M + i as f32 * (ancho_modo + separacion), y, ancho_modo, 56.0);
+        let x_modo = |i: usize| M + i as f32 * (ancho_modo + separacion);
+        let ms_elegir = self.ms_movimiento(MS_ELEGIR);
+        let pildora = MODOS.iter().position(|m| m.0 == e.modo).map(|i| {
+            self.t.modo.ir_a(x_modo(i), ms_elegir, Curva::Movimiento, reloj);
+            self.t.modo.en(reloj)
+        });
+        for (i, (modo, ..)) in MODOS.iter().enumerate() {
+            let c = Caja::new(x_modo(i), y, ancho_modo, 56.0);
             let accion = Accion::Modo(*modo);
-            let elegido = e.modo == *modo;
-            let (fondo, letra) = if elegido { (Color::rgb(*color), SOBRE_ACENTO) } else { (self.fondo_de(accion), TEXTO) };
-            l.caja(c, 8.0, fondo);
+            self.aplicar_apriete(l, c, accion);
+            l.caja(c, 8.0, self.fondo_de(accion));
+            l.sin_transformar();
+        }
+        if let Some(px) = pildora {
+            let c = Caja::new(px, y, ancho_modo, 56.0);
+            self.aplicar_apriete(l, c, Accion::Modo(e.modo));
+            l.caja(c, 8.0, acento);
+            l.sin_transformar();
+        }
+        for (i, (modo, nombre, icono, _)) in MODOS.iter().enumerate() {
+            let c = Caja::new(x_modo(i), y, ancho_modo, 56.0);
+            let accion = Accion::Modo(*modo);
+            let letra = TEXTO.mezcla(SOBRE_ACENTO, pildora.map_or(0.0, |px| cobertura(px, c.x, ancho_modo)));
+            self.aplicar_apriete(l, c, accion);
             let zona_icono = Caja::new(c.x, c.y + 7.0, c.w, 24.0);
             match *icono {
                 ICONO_COPO => dibujar_copo(l, zona_icono.x + zona_icono.w / 2.0, zona_icono.y + 12.0, 9.0, letra),
@@ -866,6 +1351,7 @@ impl App {
                 codigo => l.icono(codigo, zona_icono, 16.0, letra),
             }
             l.texto(nombre, Caja::new(c.x, c.y + 32.0, c.w, 18.0), 11.0, Peso::Normal, Alinear::Centro, letra);
+            l.sin_transformar();
             self.zona(c, accion);
         }
 
@@ -873,13 +1359,31 @@ impl App {
         let y = 322.0;
         l.texto("Ventilador", Caja::new(M, y, 74.0, 32.0), 12.0, Peso::Normal, Alinear::Izquierda, TEXTO_2);
         let ancho_vent = (INTERIOR - 76.0 - separacion * 3.0) / 4.0;
-        for (i, (velocidad, nombre)) in VENTILADORES.iter().enumerate() {
-            let c = Caja::new(M + 76.0 + i as f32 * (ancho_vent + separacion), y, ancho_vent, 32.0);
+        let x_vent = |i: usize| M + 76.0 + i as f32 * (ancho_vent + separacion);
+        let pildora = VENTILADORES.iter().position(|v| v.0 == e.ventilador).map(|i| {
+            self.t.ventilador.ir_a(x_vent(i), ms_elegir, Curva::Movimiento, reloj);
+            self.t.ventilador.en(reloj)
+        });
+        for (i, (velocidad, _)) in VENTILADORES.iter().enumerate() {
+            let c = Caja::new(x_vent(i), y, ancho_vent, 32.0);
             let accion = Accion::Ventilador(*velocidad);
-            let elegido = e.ventilador == *velocidad;
-            let (fondo, letra) = if elegido { (acento, SOBRE_ACENTO) } else { (self.fondo_de(accion), TEXTO) };
-            l.caja(c, 6.0, fondo);
+            self.aplicar_apriete(l, c, accion);
+            l.caja(c, 6.0, self.fondo_de(accion));
+            l.sin_transformar();
+        }
+        if let Some(px) = pildora {
+            let c = Caja::new(px, y, ancho_vent, 32.0);
+            self.aplicar_apriete(l, c, Accion::Ventilador(e.ventilador));
+            l.caja(c, 6.0, acento);
+            l.sin_transformar();
+        }
+        for (i, (velocidad, nombre)) in VENTILADORES.iter().enumerate() {
+            let c = Caja::new(x_vent(i), y, ancho_vent, 32.0);
+            let accion = Accion::Ventilador(*velocidad);
+            let letra = TEXTO.mezcla(SOBRE_ACENTO, pildora.map_or(0.0, |px| cobertura(px, c.x, ancho_vent)));
+            self.aplicar_apriete(l, c, accion);
             l.texto(nombre, c, 12.0, Peso::Normal, Alinear::Centro, letra);
+            l.sin_transformar();
             self.zona(c, accion);
         }
 
@@ -896,6 +1400,7 @@ impl App {
             self.vista.apagar_en,
             t,
             acento,
+            0,
             Accion::SumarApagado,
             Accion::CancelarApagado,
         );
@@ -907,6 +1412,7 @@ impl App {
             self.vista.encender_en,
             t,
             acento,
+            1,
             Accion::SumarEncendido,
             Accion::CancelarEncendido,
         );
@@ -914,7 +1420,7 @@ impl App {
         self.pintar_pie(l, 490.0);
     }
 
-    fn pintar_regla(&mut self, l: &mut Lienzo, e: &Estado, acento: Color) {
+    fn pintar_regla(&mut self, l: &mut Lienzo, e: &Estado, acento: Color, prendido: f32, pidiendo: f32) {
         let y = REGLA_Y;
         let x_de = |t: f32| REGLA_X + (t.clamp(TEMP_MINIMA, TEMP_MAXIMA) - TEMP_MINIMA) / (TEMP_MAXIMA - TEMP_MINIMA) * REGLA_ANCHO;
 
@@ -927,26 +1433,35 @@ impl App {
             grado += 1;
         }
         let ventilando = e.modo == MODO_VENTILAR;
+        let reloj = self.reloj;
+        if self.regla_directa {
+            self.t.objetivo.saltar(e.objetivo);
+            self.regla_directa = false;
+        } else {
+            self.t.objetivo.ir_a(e.objetivo, self.ms_movimiento(MS_REGLA), Curva::Salida, reloj);
+        }
+        let objetivo = self.t.objetivo.en(reloj);
         if let Some(interior) = e.interior {
-            let x_cuarto = x_de(interior);
+            self.t.cuarto.ir_a(interior, self.ms_movimiento(MS_ELEGIR), Curva::Movimiento, reloj);
+            let x_cuarto = x_de(self.t.cuarto.en(reloj));
             if !ventilando {
                 // Tramo entre el objetivo y el cuarto: lo que le falta al aire
-                l.linea(x_de(e.objetivo), y, x_cuarto, y, 4.0, acento.con_alfa(if e.encendido { 0.55 } else { 0.2 }));
+                l.linea(x_de(objetivo), y, x_cuarto, y, 4.0, acento.con_alfa(0.2 + 0.35 * prendido));
             }
             l.circulo(x_cuarto, y, 6.0, SUPERFICIE);
             l.anillo(x_cuarto, y, 4.0, 2.0, TEXTO);
         }
         if !ventilando {
-            let x = x_de(e.objetivo);
+            let x = x_de(objetivo);
             l.circulo(x, y, 10.0, SUPERFICIE);
-            l.circulo(x, y, 8.0, if e.encendido { acento } else { TEXTO_2 });
+            l.circulo(x, y, 8.0, TEXTO_2.mezcla(acento, prendido));
         }
         let etiquetas = y + 11.0;
         l.texto("16°", Caja::new(M, etiquetas, 40.0, 16.0), 10.5, Peso::Normal, Alinear::Izquierda, TEXTO_3);
         l.texto("30°", Caja::new(ANCHO - M - 40.0, etiquetas, 40.0, 16.0), 10.5, Peso::Normal, Alinear::Derecha, TEXTO_3);
         // Qué significa cada marca
         let centro = ANCHO / 2.0;
-        l.circulo(centro - 62.0, etiquetas + 8.0, 4.0, if e.encendido && !ventilando { acento } else { TEXTO_2 });
+        l.circulo(centro - 62.0, etiquetas + 8.0, 4.0, TEXTO_2.mezcla(acento, pidiendo));
         l.texto("objetivo", Caja::new(centro - 54.0, etiquetas, 50.0, 16.0), 10.5, Peso::Normal, Alinear::Izquierda, TEXTO_3);
         l.anillo(centro + 8.0, etiquetas + 8.0, 3.0, 1.5, TEXTO);
         l.texto("el cuarto", Caja::new(centro + 15.0, etiquetas, 52.0, 16.0), 10.5, Peso::Normal, Alinear::Izquierda, TEXTO_3);
@@ -965,10 +1480,12 @@ impl App {
         cuando: Option<i64>,
         t: i64,
         acento: Color,
+        cual: usize,
         sumar: Accion,
         cancelar: Accion,
     ) {
         let activo = cuando.is_some();
+        self.aplicar_apriete(l, c, sumar);
         l.caja(c, 8.0, self.fondo_de(sumar));
         self.zona(c, sumar);
         l.texto(titulo, Caja::new(c.x + 10.0, c.y + 7.0, c.w - 38.0, 18.0), 12.0, Peso::Medio, Alinear::Izquierda, TEXTO);
@@ -981,26 +1498,25 @@ impl App {
                 let resta = (fin - t).max(0);
                 l.texto(&duracion(resta), Caja::new(c.x + 10.0, c.y + 28.0, c.w - 20.0, 32.0), 22.0, Peso::Liviano, Alinear::Izquierda, TEXTO);
                 l.texto(&format!("{nota} {}", hora(fin)), Caja::new(c.x + 10.0, c.y + 62.0, c.w - 20.0, 16.0), 11.0, Peso::Normal, Alinear::Izquierda, TEXTO_2);
-
-                // Un tramo por cada 30 minutos; el primero se va vaciando
-                let tramos = ((resta + TRAMO_TEMPORIZADOR - 1) / TRAMO_TEMPORIZADOR).max(1) as i32;
-                let visibles = tramos.min(8);
-                let (x0, y0) = (c.x + 10.0, c.y + 88.0);
-                let total = c.w - 20.0;
-                let hueco = 2.0;
-                let ancho = (total - hueco * (visibles - 1) as f32) / visibles as f32;
-                let parcial = resta % TRAMO_TEMPORIZADOR;
-                let parte = if parcial == 0 { 1.0 } else { parcial as f32 / TRAMO_TEMPORIZADOR as f32 };
-                for i in 0..visibles {
-                    let x = x0 + i as f32 * (ancho + hueco);
-                    let barra = Caja::new(x, y0, ancho, 5.0);
-                    l.caja(barra, 2.0, Color(0xFFFFFF, 0.12));
-                    let lleno = if i == 0 { ancho * parte } else { ancho };
-                    if lleno >= 1.0 {
-                        l.caja(Caja::new(x, y0, lleno, 5.0), 2.0, acento);
-                    }
-                }
             }
+        }
+
+        // Un tramo por cada 30 minutos; el primero se va vaciando. Cada toque hace crecer uno nuevo.
+        let resta = cuando.map_or(TRAMO_TEMPORIZADOR, |fin| (fin - t).max(0));
+        let cantidad = cuando.map_or(0, |_| ((resta + TRAMO_TEMPORIZADOR - 1) / TRAMO_TEMPORIZADOR).clamp(1, 8));
+        self.t.tramos[cual].ir_a(cantidad as f32, self.ms_movimiento(MS_TRAMO), Curva::Salida, self.reloj);
+        let (x0, y0) = (c.x + 10.0, c.y + 88.0);
+        let hueco = 2.0;
+        let parcial = resta % TRAMO_TEMPORIZADOR;
+        let parte = if parcial == 0 { 1.0 } else { parcial as f32 / TRAMO_TEMPORIZADOR as f32 };
+        let mut x = x0;
+        for (i, ancho) in tramos(self.t.tramos[cual].en(self.reloj), c.w - 20.0, hueco).into_iter().enumerate() {
+            l.caja(Caja::new(x, y0, ancho, 5.0), 2.0, Color(0xFFFFFF, 0.12));
+            let lleno = if i == 0 { ancho * parte } else { ancho };
+            if lleno >= 1.0 {
+                l.caja(Caja::new(x, y0, lleno, 5.0), 2.0, acento);
+            }
+            x += ancho + hueco;
         }
         if activo {
             let x = Caja::new(c.x + c.w - 28.0, c.y + 5.0, 24.0, 24.0);
@@ -1010,6 +1526,7 @@ impl App {
             l.icono(ICONO_CERRAR, x, 10.0, TEXTO_2);
             self.zona(x, cancelar);
         }
+        l.sin_transformar();
     }
 
     fn pintar_pie(&mut self, l: &mut Lienzo, y: f32) {
@@ -1019,25 +1536,44 @@ impl App {
             None => (String::new(), TEXTO_3),
         };
         l.texto_recortado(&texto, Caja::new(M, y, INTERIOR - 36.0, 26.0), 11.0, color);
-        self.boton_icono(l, Caja::new(ANCHO - M - 28.0, y, 28.0, 26.0), ICONO_ACTUALIZAR, 11.0, Accion::Actualizar, true);
+        let c = Caja::new(ANCHO - M - 28.0, y, 28.0, 26.0);
+        self.aplicar_apriete(l, c, Accion::Actualizar);
+        l.caja(c, 6.0, self.fondo_de(Accion::Actualizar));
+        l.sin_transformar();
+        if let Some((desde, _)) = self.actualizando {
+            l.girar(c, ((self.reloj - desde) / 1000.0 * std::f64::consts::TAU) as f32);
+        }
+        l.icono(ICONO_ACTUALIZAR, c, 11.0, TEXTO);
+        l.sin_transformar();
+        self.zona(c, Accion::Actualizar);
     }
 
     fn pintar_datos(&mut self, l: &mut Lienzo) {
         // Un solo filtro, arriba de todo lo que afecta
         let ancho = 64.0;
+        let x_rango = |i: usize| M + i as f32 * (ancho + 4.0);
+        for i in 0..RANGOS.len() {
+            if self.rango != i as u8 {
+                l.caja(Caja::new(x_rango(i), 50.0, ancho, 28.0), 6.0, self.fondo_de(Accion::Rango(i as u8)));
+            }
+        }
+        self.t.rango.ir_a(x_rango(self.rango as usize), self.ms_movimiento(MS_ELEGIR), Curva::Movimiento, self.reloj);
+        l.caja(Caja::new(self.t.rango.en(self.reloj), 50.0, ancho, 28.0), 6.0, Color(0xFFFFFF, 0.16));
         for (i, nombre) in RANGOS.iter().enumerate() {
-            let c = Caja::new(M + i as f32 * (ancho + 4.0), 50.0, ancho, 28.0);
-            let accion = Accion::Rango(i as u8);
-            let elegido = self.rango == i as u8;
-            let fondo = if elegido { Color(0xFFFFFF, 0.16) } else { self.fondo_de(accion) };
-            l.caja(c, 6.0, fondo);
-            l.texto(nombre, c, 12.0, if elegido { Peso::Medio } else { Peso::Normal }, Alinear::Centro, TEXTO);
-            self.zona(c, accion);
+            let c = Caja::new(x_rango(i), 50.0, ancho, 28.0);
+            let peso = if self.rango == i as u8 { Peso::Medio } else { Peso::Normal };
+            l.texto(nombre, c, 12.0, peso, Alinear::Centro, TEXTO);
+            self.zona(c, Accion::Rango(i as u8));
         }
         let exportar = Caja::new(ANCHO - M - 96.0, 50.0, 96.0, 28.0);
+        self.aplicar_apriete(l, exportar, Accion::Exportar);
         l.caja(exportar, 6.0, self.fondo_de(Accion::Exportar));
         l.texto("Exportar CSV", exportar, 12.0, Peso::Normal, Alinear::Centro, TEXTO);
+        l.sin_transformar();
         self.zona(exportar, Accion::Exportar);
+
+        // Al cambiar de período se funden los datos, no el filtro que se acaba de tocar
+        l.fijar_opacidad(self.t.contenido.en(self.reloj) * self.t.datos.en(self.reloj));
 
         let Some((_, historia)) = self.vista.historia.clone() else {
             l.texto("Cargando…", Caja::new(M, 100.0, INTERIOR, 24.0), 12.0, Peso::Normal, Alinear::Izquierda, TEXTO_2);
@@ -1254,13 +1790,16 @@ impl App {
         l.caja(c, 8.0, self.fondo_de(Accion::InicioWindows));
         l.texto("Iniciar con Windows", Caja::new(c.x + 12.0, c.y, 220.0, c.h), 13.0, Peso::Normal, Alinear::Izquierda, TEXTO);
         let interruptor = Caja::new(c.x + c.w - 52.0, c.y + 12.0, 40.0, 20.0);
-        if self.inicio_windows {
-            l.caja(interruptor, 10.0, Color::rgb(0x79C6F5));
-            l.circulo(interruptor.x + 30.0, interruptor.y + 10.0, 7.0, SOBRE_ACENTO);
-        } else {
-            l.borde(interruptor, 10.0, 1.5, TEXTO_2);
-            l.circulo(interruptor.x + 10.0, interruptor.y + 10.0, 5.5, TEXTO_2);
+        let destino = if self.inicio_windows { 1.0 } else { 0.0 };
+        self.t.interruptor.ir_a(destino, self.ms_movimiento(MS_INTERRUPTOR), Curva::Salida, self.reloj);
+        let paso = self.t.interruptor.en(self.reloj);
+        if paso < 1.0 {
+            l.borde(interruptor, 10.0, 1.5, TEXTO_2.con_alfa(1.0 - paso));
         }
+        if paso > 0.0 {
+            l.caja(interruptor, 10.0, Color(0x79C6F5, paso));
+        }
+        l.circulo(interruptor.x + 10.0 + 20.0 * paso, interruptor.y + 10.0, 5.5 + 1.5 * paso, TEXTO_2.mezcla(SOBRE_ACENTO, paso));
         self.zona(c, Accion::InicioWindows);
         y += 50.0;
 
@@ -1285,8 +1824,10 @@ impl App {
         let ancho = (INTERIOR - 8.0) / 2.0;
         for (i, (nombre, accion)) in [("Exportar CSV", Accion::Exportar), ("Abrir carpeta de datos", Accion::AbrirCarpeta)].into_iter().enumerate() {
             let c = Caja::new(M + i as f32 * (ancho + 8.0), y, ancho, 38.0);
+            self.aplicar_apriete(l, c, accion);
             l.caja(c, 8.0, self.fondo_de(accion));
             l.texto(nombre, c, 12.0, Peso::Normal, Alinear::Centro, TEXTO);
+            l.sin_transformar();
             self.zona(c, accion);
         }
         y += 56.0;
@@ -1294,8 +1835,10 @@ impl App {
         l.linea(M, y - 8.0, ANCHO - M, y - 8.0, 1.0, RAYA);
         for (i, (nombre, accion)) in [("Cerrar sesión", Accion::CerrarSesion), ("Salir del programa", Accion::Salir)].into_iter().enumerate() {
             let c = Caja::new(M + i as f32 * (ancho + 8.0), y, ancho, 38.0);
+            self.aplicar_apriete(l, c, accion);
             l.caja(c, 8.0, self.fondo_de(accion));
             l.texto(nombre, c, 12.0, Peso::Normal, Alinear::Centro, TEXTO);
+            l.sin_transformar();
             self.zona(c, accion);
         }
     }
@@ -1311,11 +1854,15 @@ impl App {
 
         let y = Y_CAMPO_CLAVE + 46.0;
         let marca = Caja::new(M, y + 2.0, 20.0, 20.0);
-        if self.recordar {
-            l.caja(marca, 4.0, Color::rgb(0x79C6F5));
-            l.icono(ICONO_MARCA, marca, 11.0, SOBRE_ACENTO);
-        } else {
-            l.borde(marca.adentro(0.75), 4.0, 1.5, TEXTO_2);
+        let destino = if self.recordar { 1.0 } else { 0.0 };
+        self.t.recordar.ir_a(destino, self.ms_color(MS_INTERRUPTOR), Curva::Suave, self.reloj);
+        let paso = self.t.recordar.en(self.reloj);
+        if paso < 1.0 {
+            l.borde(marca.adentro(0.75), 4.0, 1.5, TEXTO_2.con_alfa(1.0 - paso));
+        }
+        if paso > 0.0 {
+            l.caja(marca, 4.0, Color(0x79C6F5, paso));
+            l.icono(ICONO_MARCA, marca, 11.0, SOBRE_ACENTO.con_alfa(paso));
         }
         l.texto("Recordar en esta PC", Caja::new(M + 28.0, y, INTERIOR - 28.0, 24.0), 13.0, Peso::Normal, Alinear::Izquierda, TEXTO);
         self.zona(Caja::new(M, y, INTERIOR, 24.0), Accion::Recordar);
@@ -1330,8 +1877,10 @@ impl App {
 
         let boton = Caja::new(M, y + 50.0, INTERIOR, 42.0);
         let alfa = if self.apretado == Some(Accion::Entrar) { 0.75 } else { 1.0 };
+        self.aplicar_apriete(l, boton, Accion::Entrar);
         l.caja(boton, 8.0, Color(0x79C6F5, alfa));
         l.texto("Entrar", boton, 14.0, Peso::Medio, Alinear::Centro, SOBRE_ACENTO);
+        l.sin_transformar();
         self.zona(boton, Accion::Entrar);
 
         if let Some(error) = self.vista.error.clone() {
@@ -1356,7 +1905,10 @@ impl App {
                     self.zona(c, Accion::SiguienteAire);
                 }
             }
-            None => l.parrafo("Conectando con tu aire…", Caja::new(M, 60.0, INTERIOR, 40.0), 13.0, TEXTO_2),
+            None => {
+                dibujar_giro(l, M + 8.0, 69.0, 7.0, (self.reloj / 1000.0).fract() as f32, TEXTO_2);
+                l.parrafo("Conectando con tu aire…", Caja::new(M + 26.0, 60.0, INTERIOR - 26.0, 40.0), 13.0, TEXTO_2);
+            }
         }
     }
 }
@@ -1405,6 +1957,18 @@ fn dibujar_viento(l: &mut Lienzo, x: f32, y: f32, color: Color) {
     }
 }
 
+/// Un anillo abierto que da una vuelta por segundo mientras se espera.
+fn dibujar_giro(l: &mut Lienzo, x: f32, y: f32, radio: f32, vuelta: f32, color: Color) {
+    use std::f32::consts::TAU;
+    let puntos: Vec<(f32, f32)> = (0..=20)
+        .map(|i| {
+            let angulo = (vuelta + i as f32 / 20.0 * 0.75) * TAU;
+            (x + angulo.cos() * radio, y + angulo.sin() * radio)
+        })
+        .collect();
+    let _ = l.trazo(&puntos, 2.0, color);
+}
+
 fn coordenadas(app: &App, lparam: LPARAM) -> (f32, f32) {
     let escala = app.escala();
     let x = (lparam.0 & 0xFFFF) as i16 as f32 / escala;
@@ -1422,15 +1986,28 @@ unsafe extern "system" fn procedimiento(ventana: HWND, mensaje: u32, wparam: WPA
         WM_NCCALCSIZE if wparam.0 != 0 => LRESULT(0),
         WM_NCHITTEST => LRESULT(HTCLIENT as isize),
         WM_ERASEBKGND => LRESULT(1),
+        WM_WINDOWPOSCHANGING => {
+            // Activarla mientras se desliza no la tiene que traer delante de la barra de tareas
+            if app.tras_la_barra {
+                let posicion = unsafe { &mut *(lparam.0 as *mut WINDOWPOS) };
+                posicion.flags |= SWP_NOZORDER;
+            }
+            unsafe { DefWindowProcW(ventana, mensaje, wparam, lparam) }
+        }
         WM_PAINT => {
             let mut datos = PAINTSTRUCT::default();
             unsafe {
                 BeginPaint(ventana, &mut datos);
             }
-            app.pintar();
+            let zona = datos.rcPaint;
+            // Un latido es solo para mover la ventana: lo dibujado sigue sirviendo
+            if zona.right - zona.left > 1 || zona.bottom - zona.top > 1 {
+                app.pintar();
+            }
             unsafe {
                 let _ = EndPaint(ventana, &datos);
             }
+            app.avanzar();
             LRESULT(0)
         }
         WM_SIZE => {
@@ -1444,7 +2021,7 @@ unsafe extern "system" fn procedimiento(ventana: HWND, mensaje: u32, wparam: WPA
         WM_DPICHANGED => {
             app.lienzo = None;
             app.crear_fuente_campos();
-            app.ubicar();
+            app.ubicar(false);
             app.sincronizar_campos();
             LRESULT(0)
         }
@@ -1462,7 +2039,7 @@ unsafe extern "system" fn procedimiento(ventana: HWND, mensaje: u32, wparam: WPA
         WM_MOUSELEAVE => {
             app.siguiendo_raton = false;
             if !app.opciones.sin_ocultar {
-                app.caliente = None;
+                app.fijar_caliente(None);
                 app.raton = (-1.0, -1.0);
                 app.redibujar();
             }
@@ -1481,6 +2058,7 @@ unsafe extern "system" fn procedimiento(ventana: HWND, mensaje: u32, wparam: WPA
         WM_MOUSEWHEEL => {
             let giro = ((wparam.0 >> 16) & 0xFFFF) as i16;
             if app.pestana == Pestana::Control {
+                app.regla_directa = true;
                 app.mover_objetivo(if giro > 0 { 1.0 } else { -1.0 });
             }
             LRESULT(0)
@@ -1517,6 +2095,13 @@ unsafe extern "system" fn procedimiento(ventana: HWND, mensaje: u32, wparam: WPA
                     if app.vista.apagar_en.is_some() || app.vista.encender_en.is_some() {
                         app.redibujar();
                     }
+                }
+                TEMPORIZADOR_GIRO => {
+                    if app.actualizando.is_some_and(|(desde, _)| app.ms() - desde > ESPERA_MAXIMA_ACTUALIZAR_MS) {
+                        app.actualizando = None;
+                    }
+                    app.revisar_giro();
+                    app.redibujar();
                 }
                 _ => {}
             }
@@ -1652,7 +2237,7 @@ pub fn tecla_de_campo(mensaje: &MSG, ventana: HWND) -> bool {
             true
         }
         VK_ESCAPE => {
-            app.ocultar();
+            app.ocultar_ya();
             true
         }
         _ => false,
@@ -1662,6 +2247,8 @@ pub fn tecla_de_campo(mensaje: &MSG, ventana: HWND) -> bool {
 pub fn instalar(ventana: HWND, pedidos: Sender<Pedido>, compartido: Compartido, opciones: Opciones) {
     let abrir = opciones.abrir;
     let pestana = opciones.pestana;
+    // Con la cuenta guardada se muestra que está conectando, no el formulario para entrar
+    let fase = if opciones.hay_cuenta { Fase::Conectando } else { Fase::SinCuenta };
     let app = Box::new(App {
         ventana,
         pedidos,
@@ -1669,7 +2256,7 @@ pub fn instalar(ventana: HWND, pedidos: Sender<Pedido>, compartido: Compartido, 
         opciones,
         fabricas: None,
         lienzo: None,
-        vista: Vista::default(),
+        vista: Vista { fase, ..Default::default() },
         tooltip: "Aire del cuarto".to_string(),
         icono: None,
         zonas: Vec::new(),
@@ -1692,6 +2279,21 @@ pub fn instalar(ventana: HWND, pedidos: Sender<Pedido>, compartido: Compartido, 
         inicio_windows: inicio::activo(),
         pincel_campo: unsafe { CreateSolidBrush(hexa_color(CAMPO)) },
         fuente_campo: HFONT::default(),
+        origen: Instant::now(),
+        reloj: 0.0,
+        movimiento: true,
+        lugar: Lugar::default(),
+        puesto: (0, 0, 0, 0),
+        apertura: Valor::quieto(0.0),
+        cajon: Cajon::fijo(0.0),
+        tras_la_barra: false,
+        preparando: false,
+        cerrando: false,
+        t: Transiciones::nuevas(),
+        saltar: true,
+        regla_directa: false,
+        girando: false,
+        actualizando: None,
     });
     let puntero = Box::into_raw(app);
     unsafe {

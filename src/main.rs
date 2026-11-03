@@ -1,5 +1,6 @@
 #![cfg_attr(not(test), windows_subsystem = "windows")]
 
+mod animacion;
 mod bandeja;
 mod cifrado;
 mod credenciales;
@@ -126,6 +127,10 @@ fn main() {
             // igual que si no hay cuenta y hace falta entrar
             abrir: !hay("--bandeja") || !hay_cuenta,
             titulo: if demo { "Aire (demostración)" } else { "Aire del cuarto" },
+            // Solo para revisar las animaciones en la demostración
+            lentitud: if demo && hay("--lento") { 8.0 } else { 1.0 },
+            quieto: demo && hay("--quieto"),
+            hay_cuenta,
         },
     );
 

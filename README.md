@@ -87,6 +87,8 @@ Para ver el panel con un aire simulado, sin tocar el aire real ni usar tu cuenta
 cargo run --features demo -- --demo
 ```
 
+Con `--lento` las animaciones duran 8 veces más, y con `--quieto` se ven como con las animaciones de Windows apagadas.
+
 ## Origen del protocolo
 
 Las tramas del aire son un puerto de [msmart-ng](https://github.com/mill1000/midea-msmart), y las pruebas comparan el resultado
