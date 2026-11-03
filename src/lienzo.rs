@@ -10,7 +10,7 @@ use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::*;
 use windows::Win32::UI::HiDpi::GetDpiForWindow;
 use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
-use windows_numerics::Vector2;
+use windows_numerics::{Matrix3x2, Vector2};
 
 pub const FUENTE: PCWSTR = w!("Bahnschrift");
 pub const ICONOS: PCWSTR = w!("Segoe Fluent Icons");
@@ -69,6 +69,15 @@ impl Color {
         Self(self.0, alfa)
     }
 
+    pub fn mezcla(self, otro: Self, t: f32) -> Self {
+        let canal = |corrimiento: u32| {
+            let a = ((self.0 >> corrimiento) & 0xFF) as f32;
+            let b = ((otro.0 >> corrimiento) & 0xFF) as f32;
+            ((a + (b - a) * t).round() as u32) << corrimiento
+        };
+        Self(canal(16) | canal(8) | canal(0), self.1 + (otro.1 - self.1) * t)
+    }
+
     fn d2d(self) -> D2D1_COLOR_F {
         D2D1_COLOR_F {
             r: ((self.0 >> 16) & 0xFF) as f32 / 255.0,
@@ -114,6 +123,7 @@ pub struct Lienzo {
     pincel: ID2D1SolidColorBrush,
     trazo_redondo: ID2D1StrokeStyle,
     formatos: HashMap<ClaveFormato, IDWriteTextFormat>,
+    opacidad: f32,
 }
 
 fn punto(x: f32, y: f32) -> Vector2 {
@@ -166,7 +176,7 @@ impl Lienzo {
                 },
                 None,
             )?;
-            Ok(Self { fabrica, escritura, destino, pincel, trazo_redondo, formatos: HashMap::new() })
+            Ok(Self { fabrica, escritura, destino, pincel, trazo_redondo, formatos: HashMap::new(), opacidad: 1.0 })
         }
     }
 
@@ -188,8 +198,47 @@ impl Lienzo {
         unsafe { self.destino.EndDraw(None, None) }
     }
 
+    /// Afecta a todo lo que se dibuje después, para fundir una vista entera.
+    pub fn fijar_opacidad(&mut self, opacidad: f32) {
+        self.opacidad = opacidad;
+    }
+
+    /// Encoge o agranda lo que se dibuje después, desde el centro de `c`.
+    pub fn escalar(&self, c: Caja, factor: f32) {
+        let (x, y) = (c.x + c.w / 2.0, c.y + c.h / 2.0);
+        let matriz = Matrix3x2 {
+            M11: factor,
+            M12: 0.0,
+            M21: 0.0,
+            M22: factor,
+            M31: x * (1.0 - factor),
+            M32: y * (1.0 - factor),
+        };
+        unsafe { self.destino.SetTransform(&matriz) };
+    }
+
+    /// Gira lo que se dibuje después alrededor del centro de `c`.
+    pub fn girar(&self, c: Caja, radianes: f32) {
+        let (x, y) = (c.x + c.w / 2.0, c.y + c.h / 2.0);
+        let (seno, coseno) = radianes.sin_cos();
+        let matriz = Matrix3x2 {
+            M11: coseno,
+            M12: seno,
+            M21: -seno,
+            M22: coseno,
+            M31: x - x * coseno + y * seno,
+            M32: y - x * seno - y * coseno,
+        };
+        unsafe { self.destino.SetTransform(&matriz) };
+    }
+
+    pub fn sin_transformar(&self) {
+        let matriz = Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 };
+        unsafe { self.destino.SetTransform(&matriz) };
+    }
+
     fn con_color(&self, color: Color) -> &ID2D1SolidColorBrush {
-        unsafe { self.pincel.SetColor(&color.d2d()) };
+        unsafe { self.pincel.SetColor(&color.con_alfa(color.1 * self.opacidad).d2d()) };
         &self.pincel
     }
 
