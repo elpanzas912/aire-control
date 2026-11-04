@@ -1,6 +1,6 @@
 [package]
 name = "aire-control"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [[bin]]
@@ -10,6 +10,8 @@ path = "src/main.rs"
 [features]
 # Aire simulado e historial de ejemplo, para ver y probar el panel sin tocar el aire real
 demo = []
+# Cada toque de un temporizador suma 1 minuto en vez de 30, para probarlo con el aire real sin esperar
+minuto = []
 
 [dependencies]
 rusqlite = { version = "0.41", features = ["bundled"] }
