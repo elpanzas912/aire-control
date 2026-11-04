@@ -5,7 +5,7 @@ use crate::nube::{Aire, ErrorNube, Transporte};
 use crate::protocolo::{consulta_estado, fijar_estado, leer_estado, Cambios, Estado};
 use crate::tiempo::{duracion, hora};
 
-pub const TRAMO_TEMPORIZADOR: i64 = 30 * 60;
+pub const TRAMO_TEMPORIZADOR: i64 = if cfg!(feature = "minuto") { 60 } else { 30 * 60 };
 /// Si la PC estuvo apagada más que esto, prender tarde sorprendería: se avisa en vez de prender.
 const TOLERANCIA_ENCENDIDO: i64 = 15 * 60;
 const REINTENTO_TEMPORIZADOR: i64 = 30;
@@ -311,10 +311,11 @@ impl Motor {
                 if previo.encendido && !nuevo.encendido && self.vista.apagar_en.is_some() {
                     self.fijar_temporizador_apagar(None);
                 }
-                if !previo.encendido && nuevo.encendido && self.vista.encender_en.is_some() {
-                    self.fijar_temporizador_encender(None);
-                }
             }
+        }
+        // Con el aire prendido no queda nada por prender, aunque lo hayan prendido con la app cerrada
+        if origen.is_none() && nuevo.encendido {
+            self.cancelar_encendido(ahora);
         }
         self.vista.estado = Some(nuevo);
         self.vista.actualizado = ahora;
@@ -422,11 +423,19 @@ impl Motor {
         }
     }
 
-    /// Cada toque suma 30 minutos a la espera antes de prender.
+    /// Cada toque suma 30 minutos a la espera antes de prender. Con el aire prendido no hay nada que esperar:
+    /// al terminar no cambiaría nada, y parecería que el temporizador no apagó el aire.
     pub fn sumar_encendido(&mut self, ahora: i64) {
+        if self.vista.estado.as_ref().is_some_and(|e| e.encendido) {
+            return;
+        }
         let base = self.vista.encender_en.unwrap_or(ahora).max(ahora);
+        let primero = self.vista.encender_en.is_none();
         self.fijar_temporizador_encender(Some(base + TRAMO_TEMPORIZADOR));
         self.fallas_temporizador = 0;
+        if primero {
+            self.evento(ahora, &format!("Temporizador: prender a las {}", hora(base + TRAMO_TEMPORIZADOR)));
+        }
         // El apagado ya programado se corre para que el tiempo encendido no se pierda
         if let Some(apagar) = self.vista.apagar_en {
             if apagar <= base + TRAMO_TEMPORIZADOR {
@@ -759,6 +768,39 @@ mod pruebas {
         m.tic(T0 + 60 * MIN);
         assert!(aire.encendido());
         assert_eq!(m.vista.encender_en, None);
+    }
+
+    #[test]
+    fn con_el_aire_prendido_no_se_puede_prender_mas_tarde() {
+        let (mut m, aire) = preparar(true);
+        m.sumar_encendido(T0);
+        assert_eq!(m.vista.encender_en, None);
+        m.tic(T0 + 31 * MIN);
+        assert_eq!(aire.cambios_enviados(), 0);
+        assert!(m.avisos.is_empty(), "no avisa que prendió algo que ya estaba prendido");
+    }
+
+    #[test]
+    fn prender_mas_tarde_queda_en_el_historial() {
+        let (mut m, _) = preparar(false);
+        m.sumar_encendido(T0);
+        m.sumar_encendido(T0 + 5);
+        let h = m.historial.historia(T0 - 10, T0 + 100, 10).unwrap();
+        assert_eq!(h.eventos.iter().filter(|e| e.texto.starts_with("Temporizador: prender a las")).count(), 1);
+    }
+
+    #[test]
+    fn si_lo_prendieron_con_la_app_cerrada_no_queda_nada_por_prender() {
+        let historial = Historial::en_memoria().unwrap();
+        historial.fijar_ajuste(AJUSTE_ENCENDER, Some((T0 + 10 * MIN).to_string())).unwrap();
+        let aire = AireFalso::nuevo(true);
+        let mut m = Motor::nuevo(historial, T0);
+        assert_eq!(m.vista.encender_en, Some(T0 + 10 * MIN));
+        m.conectar(Box::new(aire.clone()), T0).unwrap();
+        m.tic(T0);
+        assert_eq!(m.vista.encender_en, None);
+        m.tic(T0 + 11 * MIN);
+        assert_eq!(aire.cambios_enviados(), 0);
     }
 
     #[test]

@@ -44,6 +44,7 @@ const TEXTO_3: Color = Color::rgb(0x8592A0);
 const CONTROL: Color = Color(0xFFFFFF, 0.07);
 const CONTROL_HOVER: Color = Color(0xFFFFFF, 0.13);
 const CONTROL_APRETADO: Color = Color(0xFFFFFF, 0.04);
+const CONTROL_BLOQUEADO: Color = Color(0xFFFFFF, 0.03);
 const RAYA: Color = Color(0xFFFFFF, 0.10);
 const SOBRE_ACENTO: Color = Color::rgb(0x0D1117);
 const ERROR: Color = Color::rgb(0xFF9A90);
@@ -1235,7 +1236,7 @@ impl App {
             l.sin_transformar();
             self.zona(c, accion);
         } else {
-            l.caja(c, 6.0, Color(0xFFFFFF, 0.03));
+            l.caja(c, 6.0, CONTROL_BLOQUEADO);
             l.icono(icono, c, tamano, TEXTO_3);
         }
     }
@@ -1403,6 +1404,7 @@ impl App {
             0,
             Accion::SumarApagado,
             Accion::CancelarApagado,
+            0.0,
         );
         self.pintar_temporizador(
             l,
@@ -1415,6 +1417,8 @@ impl App {
             1,
             Accion::SumarEncendido,
             Accion::CancelarEncendido,
+            // Con el aire prendido no hay nada que prender más tarde
+            prendido,
         );
 
         self.pintar_pie(l, 490.0);
@@ -1483,16 +1487,24 @@ impl App {
         cual: usize,
         sumar: Accion,
         cancelar: Accion,
+        atenuado: f32,
     ) {
         let activo = cuando.is_some();
-        self.aplicar_apriete(l, c, sumar);
-        l.caja(c, 8.0, self.fondo_de(sumar));
-        self.zona(c, sumar);
-        l.texto(titulo, Caja::new(c.x + 10.0, c.y + 7.0, c.w - 38.0, 18.0), 12.0, Peso::Medio, Alinear::Izquierda, TEXTO);
+        // Si ya está corriendo se muestra entero, para poder cancelarlo
+        let atenuado = if activo { 0.0 } else { atenuado };
+        let disponible = atenuado < 0.5;
+        if disponible {
+            self.aplicar_apriete(l, c, sumar);
+            self.zona(c, sumar);
+        }
+        l.caja(c, 8.0, self.fondo_de(sumar).mezcla(CONTROL_BLOQUEADO, atenuado));
+        let letra = TEXTO.mezcla(TEXTO_3, atenuado);
+        l.texto(titulo, Caja::new(c.x + 10.0, c.y + 7.0, c.w - 38.0, 18.0), 12.0, Peso::Medio, Alinear::Izquierda, letra);
         match cuando {
             None => {
-                l.texto("+30 min", Caja::new(c.x + 10.0, c.y + 28.0, c.w - 20.0, 32.0), 22.0, Peso::Liviano, Alinear::Izquierda, TEXTO);
-                l.texto("Cada toque suma 30", Caja::new(c.x + 10.0, c.y + 62.0, c.w - 20.0, 16.0), 11.0, Peso::Normal, Alinear::Izquierda, TEXTO_3);
+                l.texto("+30 min", Caja::new(c.x + 10.0, c.y + 28.0, c.w - 20.0, 32.0), 22.0, Peso::Liviano, Alinear::Izquierda, letra);
+                let pie = if disponible { "Cada toque suma 30" } else { "El aire ya está prendido" };
+                l.texto(pie, Caja::new(c.x + 10.0, c.y + 62.0, c.w - 20.0, 16.0), 11.0, Peso::Normal, Alinear::Izquierda, TEXTO_3);
             }
             Some(fin) => {
                 let resta = (fin - t).max(0);

@@ -31,8 +31,8 @@ aire se mezclan los datos de los dos.
 Cada toque suma 30 minutos: tres toques son 90.
 
 - **Mantener prendido:** prende el aire si estaba apagado y lo apaga cuando termina el tiempo.
-- **Prender más tarde:** espera y después prende. Si además tocás "Mantener prendido", el aire queda prendido
-  ese tiempo a partir del encendido.
+- **Prender más tarde:** espera y después prende, así que solo se puede tocar con el aire apagado. Si además tocás
+  "Mantener prendido", el aire queda prendido ese tiempo a partir del encendido.
 
 Los temporizadores los cumple este programa, no el aire:
 
@@ -88,6 +88,13 @@ cargo run --features demo -- --demo
 ```
 
 Con `--lento` las animaciones duran 8 veces más, y con `--quieto` se ven como con las animaciones de Windows apagadas.
+
+Para probar los temporizadores con el aire real sin esperar, esta versión suma 1 minuto por toque, aunque el panel siga
+diciendo 30:
+
+```bash
+cargo build --release --features minuto
+```
 
 ## Origen del protocolo
 
