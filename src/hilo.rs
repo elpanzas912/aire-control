@@ -29,6 +29,8 @@ pub enum Pedido {
     PanelAbierto(bool),
     Historia(u8),
     Potencia(i64),
+    /// En centavos
+    PrecioKwh(i64),
     ExportarCsv,
     Salir,
 }
@@ -139,6 +141,7 @@ pub fn correr(mut inicio: Inicio, pedidos: Receiver<Pedido>) {
             Some(Pedido::PanelAbierto(abierto)) => motor.panel_abierto(abierto, t),
             Some(Pedido::Historia(rango)) => motor.pedir_historia(rango, t),
             Some(Pedido::Potencia(watts)) => motor.fijar_potencia(watts),
+            Some(Pedido::PrecioKwh(centavos)) => motor.fijar_precio(centavos),
             Some(Pedido::ExportarCsv) => exportar(motor),
             None => {}
         }

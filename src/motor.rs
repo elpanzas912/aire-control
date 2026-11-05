@@ -21,7 +21,13 @@ const AJUSTE_APAGAR: &str = "temporizador_apagar";
 const AJUSTE_ENCENDER: &str = "temporizador_encender";
 const AJUSTE_POTENCIA: &str = "potencia_watts";
 const AJUSTE_AIRE: &str = "aire_elegido";
-pub const POTENCIA_INICIAL: i64 = 1100;
+const AJUSTE_PRECIO: &str = "precio_kwh_centavos";
+/// La de la chapa del Carrier 42HVA1201E en frío. En calor dice 1020 W.
+pub const POTENCIA_INICIAL: i64 = 1050;
+/// En centavos. Cargo variable de Edenor, tarifa R1 sin subsidio, desde el 1 de noviembre de 2026: $163,597 por kWh
+/// (ENReGE, resoluciones 886 y 887/2026), más el 21 % de IVA. Cada persona lo cambia por el de su factura.
+pub const PRECIO_INICIAL: i64 = 19_795;
+pub const PRECIO_MAXIMO: i64 = 10_000_000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Fase {
@@ -48,6 +54,8 @@ pub struct Vista {
     pub encender_en: Option<i64>,
     pub cambios_atendidos: u64,
     pub potencia: i64,
+    /// En centavos por kWh
+    pub precio_kwh: i64,
     pub lecturas_totales: u64,
     pub primera_lectura: Option<i64>,
     pub historia: Option<(u8, Historia)>,
@@ -66,6 +74,7 @@ impl Default for Vista {
             encender_en: None,
             cambios_atendidos: 0,
             potencia: POTENCIA_INICIAL,
+            precio_kwh: PRECIO_INICIAL,
             lecturas_totales: 0,
             primera_lectura: None,
             historia: None,
@@ -97,6 +106,7 @@ impl Motor {
                 apagar_en: historial.ajuste_numero(AJUSTE_APAGAR),
                 encender_en: historial.ajuste_numero(AJUSTE_ENCENDER),
                 potencia: historial.ajuste_numero(AJUSTE_POTENCIA).unwrap_or(POTENCIA_INICIAL),
+                precio_kwh: historial.ajuste_numero(AJUSTE_PRECIO).unwrap_or(PRECIO_INICIAL),
                 ..Default::default()
             },
             historial,
@@ -543,6 +553,11 @@ impl Motor {
     pub fn fijar_potencia(&mut self, watts: i64) {
         self.vista.potencia = watts.clamp(100, 10_000);
         let _ = self.historial.fijar_ajuste(AJUSTE_POTENCIA, Some(self.vista.potencia.to_string()));
+    }
+
+    pub fn fijar_precio(&mut self, centavos: i64) {
+        self.vista.precio_kwh = centavos.clamp(0, PRECIO_MAXIMO);
+        let _ = self.historial.fijar_ajuste(AJUSTE_PRECIO, Some(self.vista.precio_kwh.to_string()));
     }
 
     pub fn exportar_csv(&self, salida: &mut impl std::io::Write) -> Result<u64, String> {
@@ -1048,6 +1063,20 @@ mod pruebas {
         for sufijo in ["", "-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{sufijo}", ruta.display()));
         }
+    }
+
+    #[test]
+    fn el_precio_del_kwh_se_guarda_y_tiene_limites() {
+        let historial = Historial::en_memoria().unwrap();
+        let mut m = Motor::nuevo(historial, T0);
+        assert_eq!(m.vista.precio_kwh, PRECIO_INICIAL);
+        m.fijar_precio(25_050);
+        assert_eq!(m.vista.precio_kwh, 25_050);
+        assert_eq!(m.historial.ajuste_numero(AJUSTE_PRECIO), Some(25_050));
+        m.fijar_precio(-5);
+        assert_eq!(m.vista.precio_kwh, 0);
+        m.fijar_precio(i64::MAX);
+        assert_eq!(m.vista.precio_kwh, PRECIO_MAXIMO);
     }
 
     #[test]

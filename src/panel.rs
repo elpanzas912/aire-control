@@ -18,11 +18,12 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::animacion::{cobertura, tramos, Cajon, Curva, Tono, Valor};
 use crate::bandeja::{self, MENSAJE_BANDEJA};
+use crate::dinero::{leer_precio, pesos, precio_escrito};
 use crate::hilo::{Compartido, Pedido, MENSAJE_VISTA};
 use crate::historial::Historia;
 use crate::inicio;
 use crate::lienzo::{Alinear, Caja, Color, Fabricas, Lienzo, Peso};
-use crate::motor::{nombre_modo, Fase, Vista, TRAMO_TEMPORIZADOR};
+use crate::motor::{nombre_modo, Fase, Vista, PRECIO_MAXIMO, TRAMO_TEMPORIZADOR};
 use crate::protocolo::*;
 use crate::tiempo::{ahora, dia, dia_y_hora, duracion, hora};
 
@@ -32,7 +33,7 @@ const INTERIOR: f32 = ANCHO - M * 2.0;
 
 const ALTO_CONTROL: f32 = 524.0;
 const ALTO_DATOS: f32 = 640.0;
-const ALTO_AJUSTES: f32 = 360.0;
+const ALTO_AJUSTES: f32 = 410.0;
 const ALTO_LOGIN: f32 = 380.0;
 const ALTO_ESPERA: f32 = 180.0;
 
@@ -110,6 +111,12 @@ const RANGOS: [&str; 3] = ["24 h", "7 días", "30 días"];
 
 static CAMPO_CUENTA: AtomicIsize = AtomicIsize::new(0);
 static CAMPO_CLAVE: AtomicIsize = AtomicIsize::new(0);
+/// Lo más largo que se puede escribir en el precio del kWh
+const LARGO_PRECIO: usize = 12;
+
+fn campo(cual: &AtomicIsize) -> HWND {
+    HWND(cual.load(Ordering::Relaxed) as *mut _)
+}
 static MENSAJE_BARRA: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -138,6 +145,7 @@ enum Accion {
     InicioWindows,
     PotenciaMenos,
     PotenciaMas,
+    Precio,
     AbrirCarpeta,
     SiguienteAire,
     CerrarSesion,
@@ -290,6 +298,9 @@ pub struct App {
     regla_directa: bool,
     girando: bool,
     actualizando: Option<(f64, i64)>,
+    /// Lo que se está escribiendo en el precio del kWh; None mientras no se escribe.
+    editando_precio: Option<String>,
+    reemplazar_precio: bool,
 }
 
 fn x_de_pestana(p: Pestana) -> f32 {
@@ -486,6 +497,7 @@ impl App {
         if !self.visible || self.opciones.sin_ocultar {
             return;
         }
+        self.terminar_precio(true);
         self.visible = false;
         self.oculto_en = Some(Instant::now());
         self.foco = None;
@@ -767,9 +779,8 @@ impl App {
                 -(14.0 * self.escala()) as i32, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0,
                 DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, w!("Bahnschrift"),
             );
-            for campo in [&CAMPO_CUENTA, &CAMPO_CLAVE] {
-                let hwnd = HWND(campo.load(Ordering::Relaxed) as *mut _);
-                SendMessageW(hwnd, WM_SETFONT, Some(WPARAM(self.fuente_campo.0 as usize)), Some(LPARAM(1)));
+            for cual in [&CAMPO_CUENTA, &CAMPO_CLAVE] {
+                SendMessageW(campo(cual), WM_SETFONT, Some(WPARAM(self.fuente_campo.0 as usize)), Some(LPARAM(1)));
             }
         }
     }
@@ -782,6 +793,48 @@ impl App {
             let copiados = GetWindowTextW(hwnd, &mut buffer);
             String::from_utf16_lossy(&buffer[..copiados as usize])
         }
+    }
+
+    // Precio del kWh. Se dibuja como el resto del panel: un campo de Windows no respeta el fondo translúcido
+
+    fn empezar_precio(&mut self) {
+        if self.editando_precio.is_none() {
+            self.editando_precio = Some(precio_escrito(self.vista.precio_kwh));
+            self.reemplazar_precio = true;
+        }
+        self.redibujar();
+    }
+
+    fn escribir_precio(&mut self, letra: char) {
+        let Some(texto) = self.editando_precio.as_mut() else { return };
+        let aceptada = letra == '\u{8}' || letra.is_ascii_digit() || letra == ',' || letra == '.';
+        if !aceptada {
+            return;
+        }
+        // Recién abierto, el precio está todo elegido: lo primero que se escribe lo reemplaza
+        if self.reemplazar_precio {
+            texto.clear();
+            self.reemplazar_precio = false;
+        }
+        if letra == '\u{8}' {
+            texto.pop();
+        } else if texto.chars().count() < LARGO_PRECIO {
+            texto.push(letra);
+        }
+        self.redibujar();
+    }
+
+    /// Si lo escrito no se entiende, queda el precio que había.
+    fn terminar_precio(&mut self, guardar: bool) {
+        let Some(texto) = self.editando_precio.take() else { return };
+        if let Some(centavos) = leer_precio(&texto).filter(|_| guardar) {
+            let centavos = centavos.clamp(0, PRECIO_MAXIMO);
+            if centavos != self.vista.precio_kwh {
+                self.vista.precio_kwh = centavos;
+                self.enviar(Pedido::PrecioKwh(centavos));
+            }
+        }
+        self.redibujar();
     }
 
     fn limpiar_clave() {
@@ -979,8 +1032,10 @@ impl App {
                 }
                 self.redibujar();
             }
-            Accion::PotenciaMenos => self.enviar(Pedido::Potencia(self.vista.potencia - 100)),
-            Accion::PotenciaMas => self.enviar(Pedido::Potencia(self.vista.potencia + 100)),
+            // De a 50 W: las chapas suelen decir valores como 1050 W
+            Accion::PotenciaMenos => self.enviar(Pedido::Potencia(self.vista.potencia - 50)),
+            Accion::PotenciaMas => self.enviar(Pedido::Potencia(self.vista.potencia + 50)),
+            Accion::Precio => self.empezar_precio(),
             Accion::AbrirCarpeta => {
                 let _ = std::process::Command::new("explorer").arg(inicio::carpeta_datos()).spawn();
             }
@@ -1084,6 +1139,10 @@ impl App {
     }
 
     fn al_apretar(&mut self, x: f32, y: f32) {
+        // Tocar otra parte del panel termina de escribir el precio
+        if self.editando_precio.is_some() && self.zona_en(x, y) != Some(Accion::Precio) {
+            self.terminar_precio(true);
+        }
         self.teclado = false;
         self.apretado = self.zona_en(x, y);
         if self.apretado == Some(Accion::Regla) {
@@ -1113,6 +1172,15 @@ impl App {
     }
 
     fn al_tecla(&mut self, tecla: u16) {
+        if self.editando_precio.is_some() {
+            // Mientras se escribe el precio, los números llegan por WM_CHAR
+            match VIRTUAL_KEY(tecla) {
+                VK_RETURN | VK_TAB => self.terminar_precio(true),
+                VK_ESCAPE => self.terminar_precio(false),
+                _ => {}
+            }
+            return;
+        }
         match VIRTUAL_KEY(tecla) {
             VK_ESCAPE => self.ocultar_ya(),
             VK_UP => {
@@ -1603,14 +1671,16 @@ impl App {
         }
 
         // Cifra principal y dos datos de apoyo
-        l.texto(&duracion(historia.segundos_encendido), Caja::new(M, 88.0, 190.0, 38.0), 28.0, Peso::Liviano, Alinear::Izquierda, TEXTO);
-        l.texto("prendido en este período", Caja::new(M, 124.0, 190.0, 16.0), 11.0, Peso::Normal, Alinear::Izquierda, TEXTO_3);
-        let kwh = historia.segundos_enfriando_o_calentando as f32 / 3600.0 * self.vista.potencia as f32 / 1000.0;
-        let x = ANCHO - M - 158.0;
-        l.texto(&historia.encendidos.to_string(), Caja::new(x, 96.0, 60.0, 28.0), 18.0, Peso::Normal, Alinear::Izquierda, TEXTO);
-        l.texto("encendidos", Caja::new(x, 124.0, 66.0, 16.0), 11.0, Peso::Normal, Alinear::Izquierda, TEXTO_3);
-        l.texto(&format!("≈ {} kWh", decimal(kwh)), Caja::new(x + 68.0, 96.0, 92.0, 28.0), 18.0, Peso::Normal, Alinear::Izquierda, TEXTO);
-        l.texto("estimado", Caja::new(x + 68.0, 124.0, 90.0, 16.0), 11.0, Peso::Normal, Alinear::Izquierda, TEXTO_3);
+        l.texto(&duracion(historia.segundos_encendido), Caja::new(M, 88.0, 172.0, 38.0), 28.0, Peso::Liviano, Alinear::Izquierda, TEXTO);
+        l.texto("prendido en este período", Caja::new(M, 124.0, 172.0, 16.0), 11.0, Peso::Normal, Alinear::Izquierda, TEXTO_3);
+        let kwh = historia.segundos_enfriando_o_calentando as f64 / 3600.0 * self.vista.potencia as f64 / 1000.0;
+        let costo = kwh * self.vista.precio_kwh as f64 / 100.0;
+        let x = ANCHO - M - 168.0;
+        l.texto(&historia.encendidos.to_string(), Caja::new(x, 96.0, 56.0, 28.0), 18.0, Peso::Normal, Alinear::Izquierda, TEXTO);
+        l.texto("encendidos", Caja::new(x, 124.0, 60.0, 16.0), 11.0, Peso::Normal, Alinear::Izquierda, TEXTO_3);
+        // Lo que costó es lo que importa; los kWh quedan abajo, como de dónde sale la cuenta
+        l.texto(&format!("≈ {}", pesos(costo)), Caja::new(x + 62.0, 96.0, 106.0, 28.0), 18.0, Peso::Normal, Alinear::Izquierda, TEXTO);
+        l.texto(&format!("{} kWh", decimal(kwh as f32)), Caja::new(x + 62.0, 124.0, 106.0, 16.0), 11.0, Peso::Normal, Alinear::Izquierda, TEXTO_3);
 
         self.pintar_grafico(l, &historia);
 
@@ -1824,6 +1894,13 @@ impl App {
         self.boton_icono(l, Caja::new(c.x + c.w - 36.0, c.y + 8.0, 28.0, 28.0), ICONO_MAS, 10.0, Accion::PotenciaMas, self.vista.potencia < 10_000);
         y += 50.0;
 
+        // Precio del kWh, para pasar el consumo a pesos: se toca y se escribe
+        let c = fila(y);
+        l.caja(c, 8.0, CONTROL);
+        l.texto("Precio del kWh", Caja::new(c.x + 12.0, c.y, 180.0, c.h), 13.0, Peso::Normal, Alinear::Izquierda, TEXTO);
+        self.pintar_campo_precio(l, Caja::new(c.x + c.w - 124.0, c.y + 7.0, 112.0, 30.0));
+        y += 50.0;
+
         let desde = self.vista.primera_lectura.map(dia).unwrap_or_else(|| "hoy".to_string());
         l.parrafo(
             &format!("{} lecturas guardadas desde {desde}.", self.vista.lecturas_totales),
@@ -1853,6 +1930,28 @@ impl App {
             l.sin_transformar();
             self.zona(c, accion);
         }
+    }
+
+    fn pintar_campo_precio(&mut self, l: &mut Lienzo, campo: Caja) {
+        let editando = self.editando_precio.is_some();
+        let fondo = if editando { Color(0x000000, 0.25) } else { self.fondo_de(Accion::Precio) };
+        l.caja(campo, 6.0, fondo);
+        if editando {
+            l.borde(campo.adentro(0.75), 6.0, 1.5, Color::rgb(0x79C6F5));
+        }
+        l.texto("$", Caja::new(campo.x + 10.0, campo.y, 14.0, campo.h), 13.0, Peso::Normal, Alinear::Izquierda, TEXTO_2);
+        let texto = self.editando_precio.clone().unwrap_or_else(|| precio_escrito(self.vista.precio_kwh));
+        let derecha = campo.x + campo.w - 10.0;
+        if editando && self.reemplazar_precio {
+            // Todo elegido: lo primero que se escriba lo reemplaza
+            let ancho = l.medir(&texto, 13.0, Peso::Normal);
+            l.caja(Caja::new(derecha - ancho - 2.0, campo.y + 6.0, ancho + 4.0, campo.h - 12.0), 3.0, Color(0x79C6F5, 0.35));
+        }
+        l.texto(&texto, Caja::new(campo.x + 24.0, campo.y, derecha - campo.x - 24.0, campo.h), 13.0, Peso::Normal, Alinear::Derecha, TEXTO);
+        if editando && !self.reemplazar_precio {
+            l.linea(derecha + 1.5, campo.y + 8.0, derecha + 1.5, campo.y + campo.h - 8.0, 1.0, TEXTO);
+        }
+        self.zona(campo, Accion::Precio);
     }
 
     fn pintar_login(&mut self, l: &mut Lienzo) {
@@ -2062,6 +2161,12 @@ unsafe extern "system" fn procedimiento(ventana: HWND, mensaje: u32, wparam: WPA
             app.al_apretar(x, y);
             LRESULT(0)
         }
+        WM_CHAR => {
+            if let Some(letra) = char::from_u32(wparam.0 as u32) {
+                app.escribir_precio(letra);
+            }
+            LRESULT(0)
+        }
         WM_LBUTTONUP => {
             let (x, y) = coordenadas(app, lparam);
             app.al_soltar(x, y);
@@ -2221,8 +2326,8 @@ pub fn tecla_de_campo(mensaje: &MSG, ventana: HWND) -> bool {
     if mensaje.message != WM_KEYDOWN {
         return false;
     }
-    let cuenta = HWND(CAMPO_CUENTA.load(Ordering::Relaxed) as *mut _);
-    let clave = HWND(CAMPO_CLAVE.load(Ordering::Relaxed) as *mut _);
+    let cuenta = campo(&CAMPO_CUENTA);
+    let clave = campo(&CAMPO_CLAVE);
     if mensaje.hwnd != cuenta && mensaje.hwnd != clave {
         return false;
     }
@@ -2306,6 +2411,8 @@ pub fn instalar(ventana: HWND, pedidos: Sender<Pedido>, compartido: Compartido, 
         regla_directa: false,
         girando: false,
         actualizando: None,
+        editando_precio: None,
+        reemplazar_precio: false,
     });
     let puntero = Box::into_raw(app);
     unsafe {

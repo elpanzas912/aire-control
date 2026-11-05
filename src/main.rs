@@ -6,6 +6,7 @@ mod cifrado;
 mod credenciales;
 #[cfg(feature = "demo")]
 mod demo;
+mod dinero;
 mod hilo;
 mod historial;
 mod inicio;
