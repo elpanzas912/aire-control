@@ -48,11 +48,18 @@ Se guardan en `%LOCALAPPDATA%\AireControl\aire.db`, y desde el panel se pueden e
 - **Cada lectura:** encendido, modo, objetivo, temperatura adentro y afuera, ventilador, oscilación, eco, turbo,
   sueño, pantalla, aviso de filtro y código de error.
 - **Cada evento:** qué cambió y desde dónde (la app, el temporizador, o el control remoto u otra app).
-- **Calculado:** tiempo prendido, cantidad de encendidos, tiempo por modo, promedios, mínimas y máximas.
+- **Calculado:** tiempo prendido, cantidad de encendidos, tiempo por modo, promedios, mínimas, máximas y lo que
+  costó en pesos.
 
 El consumo en kWh es una **estimación**: multiplica el tiempo prendido, sin contar Ventilar, por la potencia
-configurada en los ajustes (1100 W si no la cambiás). No sabe cuándo descansa el compresor, así que puede dar de más.
-El aire con el que se probó no respondió a las consultas de consumo real ni de compresor.
+configurada en los ajustes. Viene con 1050 W, lo que dice la chapa del Carrier 42HVA1201E en frío; en calor dice
+1020 W. No sabe cuándo descansa el compresor, así que puede dar de más. El aire con el que se probó no respondió a las
+consultas de consumo real ni de compresor.
+
+El costo multiplica esos kWh por el precio del kWh, que se cambia en los ajustes tocándolo y escribiendo el nuevo.
+Viene con $197,95: el cargo variable de Edenor para la tarifa R1 sin subsidio desde el 1 de noviembre de 2026
+($163,597), más el 21 % de IVA. Conviene poner el de tu factura, porque cambia con la empresa, el escalón de consumo,
+los subsidios y los otros impuestos.
 
 Las lecturas se hacen cada minuto con el aire prendido, cada 5 minutos con el aire apagado y cada 20 segundos con
 el panel abierto.
